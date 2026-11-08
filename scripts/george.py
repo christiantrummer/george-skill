@@ -1973,10 +1973,20 @@ def _try_select_datacarrier_type(page, file_type: str) -> None:
         pass
 
 
+_DATACARRIER_SELECT_BUTTON = re.compile(r"select a file|datei ausw", re.I)
+_DATACARRIER_IMPORT_BUTTON = re.compile(r"^\s*(import|importieren)\s*$", re.I)
+_DATACARRIER_OK_BUTTON = re.compile(r"^\s*ok\s*$", re.I)
+# Skip the hidden image-upload inputs ("Change image") that George has on many pages.
+_DATACARRIER_FILE_INPUT = 'input[type="file"]:not([accept*="image/"]):not([data-cy="image-upload-file-input"])'
+
+
 def upload_datacarrier_file(page, file_path: Path, file_type: Optional[str] = None) -> Optional[dict]:
-    print(f"[datacarrier-upload] Opening upload page...", flush=True)
-    page.goto(DATACARRIER_UPLOAD_URL, wait_until="domcontentloaded")
-    time.sleep(2)
+    select_button = page.get_by_role("button", name=_DATACARRIER_SELECT_BUTTON)
+    # After the previous file's OK click the form is already showing; don't navigate again.
+    if select_button.count() == 0 and page.locator(_DATACARRIER_FILE_INPUT).count() == 0:
+        print(f"[datacarrier-upload] Opening upload page...", flush=True)
+        page.goto(DATACARRIER_UPLOAD_URL, wait_until="domcontentloaded")
+        time.sleep(2)
     dismiss_modals(page)
 
     if file_type:
@@ -2000,27 +2010,68 @@ def upload_datacarrier_file(page, file_path: Path, file_type: Optional[str] = No
         'button[type="submit"]',
     ]
 
-    # Find the file input (may be hidden in new George UI)
+    # Pick the file via "Or select a file", as a user does; else use the (hidden) file input.
+    chooser = None
     try:
-        file_input = page.locator('input[type="file"]')
-        # Don't wait for visibility - just check it exists in DOM
-        file_input.wait_for(state="attached", timeout=30000)
-    except Exception as e:
-        print(f"[datacarrier-upload] ERROR: Could not find file input: {e}", flush=True)
-        return None
+        with page.expect_file_chooser(timeout=10000) as chooser_info:
+            select_button.first.click(timeout=10000)
+        chooser = chooser_info.value
+    except Exception:
+        try:
+            file_input = page.locator(_DATACARRIER_FILE_INPUT)
+            # Don't wait for visibility - just check it exists in DOM
+            file_input.wait_for(state="attached", timeout=30000)
+        except Exception as e:
+            print(f"[datacarrier-upload] ERROR: Could not find file input: {e}", flush=True)
+            return None
 
-    response = None
+    settled = []  # requests the browser reported as finished or failed
+
+    def _on_settled(request) -> None:
+        settled.append(request)
+
+    page.on("requestfinished", _on_settled)
+    page.on("requestfailed", _on_settled)
     try:
-        with page.expect_response(_is_datacarrier_response, timeout=120000) as resp_info:
-            file_input.set_input_files(str(file_path))
-            clicked = _click_first_visible_button(page, upload_buttons)
-            if not clicked:
-                # Some UIs auto-upload after file selection
-                pass
-        response = resp_info.value
-    except PlaywrightTimeout:
-        print("[datacarrier-upload] ERROR: Timed out waiting for upload response", flush=True)
-        return None
+        try:
+            with page.expect_response(_is_datacarrier_response, timeout=120000) as resp_info:
+                if chooser:
+                    chooser.set_files(str(file_path))
+                else:
+                    file_input.set_input_files(str(file_path))
+                # George's own "Import" button; the generic list is the fallback for other UIs.
+                import_button = page.get_by_role("button", name=_DATACARRIER_IMPORT_BUTTON)
+                if import_button.count() > 0:
+                    import_button.first.click()
+                    clicked = True
+                else:
+                    clicked = _click_first_visible_button(page, upload_buttons)
+                if not clicked:
+                    # Some UIs auto-upload after file selection
+                    pass
+            response = resp_info.value
+        except PlaywrightTimeout:
+            print("[datacarrier-upload] ERROR: Timed out waiting for upload response", flush=True)
+            return None
+
+        # Close the "Thank you for your data import" screen so the form is ready for the next file.
+        try:
+            page.get_by_role("button", name=_DATACARRIER_OK_BUTTON).first.click(timeout=10000)
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        # response.json() first waits, without a timeout, until the browser reports the request
+        # as finished. George's upload request does not always get that report, which hung the
+        # upload forever. Read the body only once it has; otherwise return the HTTP status.
+        deadline = time.time() + 10
+        while response.request not in settled and time.time() < deadline:
+            page.wait_for_timeout(200)
+        if response.request not in settled:
+            return {"status": response.status}
+    finally:
+        page.remove_listener("requestfinished", _on_settled)
+        page.remove_listener("requestfailed", _on_settled)
 
     try:
         return response.json()
