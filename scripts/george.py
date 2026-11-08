@@ -2880,8 +2880,35 @@ def cmd_datacarrier_list(args):
     return 0
 
 
+def _wait_for_datacarrier_done(context, resp_id, timeout_s: int) -> None:
+    """Poll the datacarrier-files list until the given file id reaches DONE (or timeout)."""
+    print(f"[datacarrier-upload] Waiting for file id={resp_id} to reach DONE...", flush=True)
+    last_state = None
+    start = time.time()
+    timeout_s = max(int(timeout_s or 0), 0)
+    while True:
+        if timeout_s > 0 and time.time() - start > timeout_s:
+            print(f"[datacarrier-upload] Timed out after {timeout_s}s waiting for DONE", flush=True)
+            break
+        try:
+            resp = context.request.get(_build_datacarrier_files_list_url(), timeout=30000)
+            payload = resp.json()
+        except Exception as e:
+            print(f"[datacarrier-upload] Polling error: {e}", flush=True)
+            time.sleep(3)
+            continue
+
+        state, _item = _extract_datacarrier_file_state(payload, resp_id)
+        if state and state != last_state:
+            print(f"[datacarrier-upload] State={state}", flush=True)
+            last_state = state
+        if state == "DONE":
+            break
+        time.sleep(3)
+
+
 def cmd_datacarrier_upload(args):
-    """Upload a data-carrier file."""
+    """Upload one or more data-carrier files in a single George session."""
     try:
         user_id = _resolve_user_id(args)
     except Exception as e:
@@ -2892,20 +2919,31 @@ def cmd_datacarrier_upload(args):
     global USER_ID_OVERRIDE
     USER_ID_OVERRIDE = user_id
 
-    file_path = Path(args.file).expanduser().resolve()
-    if not file_path.exists() or not file_path.is_file():
-        print(f"[datacarrier-upload] ERROR: File not found: {file_path}", flush=True)
-        return 1
+    # Validate every file before logging in, so a bad argument never leaves a half-uploaded batch.
+    file_paths: list[Path] = []
+    for raw_path in args.files:
+        file_path = Path(raw_path).expanduser().resolve()
+        if not file_path.exists() or not file_path.is_file():
+            print(f"[datacarrier-upload] ERROR: File not found: {file_path}", flush=True)
+            return 1
 
-    try:
-        _validate_upload_file(file_path)
-    except ValueError as e:
-        print(f"[datacarrier-upload] ERROR: {e}", flush=True)
-        return 1
+        try:
+            _validate_upload_file(file_path)
+        except ValueError as e:
+            print(f"[datacarrier-upload] ERROR: {e}", flush=True)
+            return 1
+
+        if file_path in file_paths:
+            print(f"[datacarrier-upload] ERROR: File given more than once: {file_path}", flush=True)
+            return 1
+        file_paths.append(file_path)
 
     output_dir = Path(args.output) if args.output else None
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
+
+    uploaded: list[Path] = []
+    failed: Optional[Path] = None
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -2921,64 +2959,56 @@ def cmd_datacarrier_upload(args):
                 return 1
 
             dismiss_modals(page)
-            payload = upload_datacarrier_file(page, file_path, args.type)
-            if payload is None:
-                return 1
+            for index, file_path in enumerate(file_paths, start=1):
+                if len(file_paths) > 1:
+                    print(f"[datacarrier-upload] File {index}/{len(file_paths)}: {file_path.name}", flush=True)
 
-            resp_id = None
-            resp_status = None
-            if isinstance(payload, dict):
-                resp_id = (
-                    payload.get("id")
-                    or payload.get("fileId")
-                    or payload.get("uuid")
-                    or payload.get("reference")
-                    or payload.get("datacarrierFileId")
-                )
-                resp_status = payload.get("status") or payload.get("state") or payload.get("result")
+                payload = upload_datacarrier_file(page, file_path, args.type)
+                if payload is None:
+                    failed = file_path
+                    break
 
-            id_part = f" id={resp_id}" if resp_id is not None else ""
-            status_part = f" status={resp_status}" if resp_status is not None else ""
-            print(f"[datacarrier-upload] Uploaded {file_path.name}{id_part}{status_part}", flush=True)
+                resp_id = None
+                resp_status = None
+                if isinstance(payload, dict):
+                    resp_id = (
+                        payload.get("id")
+                        or payload.get("fileId")
+                        or payload.get("uuid")
+                        or payload.get("reference")
+                        or payload.get("datacarrierFileId")
+                    )
+                    resp_status = payload.get("status") or payload.get("state") or payload.get("result")
 
-            if output_dir:
-                ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                out_path = output_dir / f"{file_path.name}.datacarrier.{ts}.json"
-                with open(out_path, "w") as f:
-                    json.dump(payload, f, indent=2, sort_keys=True)
-                print(f"[datacarrier-upload] Saved response: {out_path}", flush=True)
+                id_part = f" id={resp_id}" if resp_id is not None else ""
+                status_part = f" status={resp_status}" if resp_status is not None else ""
+                print(f"[datacarrier-upload] Uploaded {file_path.name}{id_part}{status_part}", flush=True)
+                uploaded.append(file_path)
 
-            if args.wait_done:
-                if resp_id is None:
-                    print("[datacarrier-upload] --wait-done requested but upload response has no file id", flush=True)
-                else:
-                    print(f"[datacarrier-upload] Waiting for file id={resp_id} to reach DONE...", flush=True)
-                    last_state = None
-                    start = time.time()
-                    timeout_s = max(int(getattr(args, "wait_done_timeout", 120) or 0), 0)
-                    while True:
-                        if timeout_s > 0 and time.time() - start > timeout_s:
-                            print(f"[datacarrier-upload] Timed out after {timeout_s}s waiting for DONE", flush=True)
-                            break
-                        try:
-                            resp = context.request.get(_build_datacarrier_files_list_url(), timeout=30000)
-                            payload = resp.json()
-                        except Exception as e:
-                            print(f"[datacarrier-upload] Polling error: {e}", flush=True)
-                            time.sleep(3)
-                            continue
+                if output_dir:
+                    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                    out_path = output_dir / f"{file_path.name}.datacarrier.{ts}.json"
+                    with open(out_path, "w") as f:
+                        json.dump(payload, f, indent=2, sort_keys=True)
+                    print(f"[datacarrier-upload] Saved response: {out_path}", flush=True)
 
-                        state, _item = _extract_datacarrier_file_state(payload, resp_id)
-                        if state and state != last_state:
-                            print(f"[datacarrier-upload] State={state}", flush=True)
-                            last_state = state
-                        if state == "DONE":
-                            break
-                        time.sleep(3)
+                if args.wait_done:
+                    if resp_id is None:
+                        print("[datacarrier-upload] --wait-done requested but upload response has no file id", flush=True)
+                    else:
+                        _wait_for_datacarrier_done(context, resp_id, getattr(args, "wait_done_timeout", 120))
         finally:
             context.close()
 
-    return 0
+    if len(file_paths) > 1:
+        not_attempted = file_paths[len(uploaded) + (1 if failed else 0):]
+        print(f"[datacarrier-upload] Summary: {len(uploaded)}/{len(file_paths)} uploaded", flush=True)
+        if failed:
+            print(f"[datacarrier-upload]   failed: {failed.name}", flush=True)
+        for file_path in not_attempted:
+            print(f"[datacarrier-upload]   not attempted: {file_path.name}", flush=True)
+
+    return 1 if failed else 0
 
 
 def cmd_datacarrier_sign(args):
@@ -4030,8 +4060,8 @@ def main():
     dc_list_parser.add_argument("--state", default=None, help="Filter orders by state (e.g. OPEN, CLOSED)")
     dc_list_parser.set_defaults(func=cmd_datacarrier_list)
 
-    dc_upload_parser = subparsers.add_parser("datacarrier-upload", help="Upload a data-carrier file (SEPA XML, CAMT, MT940)")
-    dc_upload_parser.add_argument("file", help="Path to the file to upload")
+    dc_upload_parser = subparsers.add_parser("datacarrier-upload", help="Upload one or more data-carrier files (SEPA XML, CAMT, MT940)")
+    dc_upload_parser.add_argument("files", nargs="+", metavar="file", help="Path(s) to the file(s) to upload, in one session")
     dc_upload_parser.add_argument("--type", default=None, help="Override file type hint (e.g. pain.001, camt.053)")
     dc_upload_parser.add_argument("--out", dest="output", default=None, help="Directory to save the upload response JSON")
     dc_upload_parser.add_argument("--wait-done", action="store_true", default=False, help="Poll until file reaches DONE state")
