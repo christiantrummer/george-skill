@@ -47,6 +47,6 @@ login → transfer → logout
 Always call `logout` after completing all operations to clear the stored browser session (cookies, local storage, Playwright profile). This minimizes persistent auth state on disk.
 
 ## Notes
-- `transfer` creates the order unsigned unless `--sign` is given. With `--sign` it asks y/N (skip with `--yes`), and the transfer still needs approval on the phone. `--to-contact` takes the recipient's IBAN and name from the George address book (`contacts` lists it). Receiver IBANs from EU/EEA countries are supported.
+- `transfer` creates the order unsigned unless `--sign` is given. With `--sign` it asks y/N before creating anything (skip with `--yes`), and the transfer still needs approval on the phone. Exit codes: `0` signed (or created unsigned without `--sign`), `1` failed before any order was created, `3` order created but not signed, `4` order created and signature requested but the outcome is unknown (the phone approval may still go through). The last line is `RESULT: <signed|created|not_signed|unknown|error> order_id=<id>`. **Never rerun `transfer` after exit 3 or 4**: that creates a second order; check or delete the existing one in George instead. `--to-contact` takes the recipient's IBAN and name from the George address book (`contacts` lists it). Receiver IBANs from EU/EEA countries are supported.
 - Session state stored in `{workspace}/george/` with restrictive permissions (dirs `700`, files `600`).
 - Ephemeral exports default to `/tmp/openclaw/george` (override with `OPENCLAW_TMP`).
