@@ -3396,6 +3396,26 @@ def _transfer_date_like(template: str, day: date) -> str:
     return day.isoformat()
 
 
+# Exit codes of `transfer`. Anything other than 1 means an order exists in George: never rerun
+# the command on it, or a second order (and a second payment) can be created.
+TRANSFER_EXIT_OK = 0             # signed, or created unsigned without --sign
+TRANSFER_EXIT_ERROR = 1          # failed before any order was created
+TRANSFER_EXIT_NOT_SIGNED = 3     # order created, definitely not signed (still open, or the signature was refused)
+TRANSFER_EXIT_SIGN_UNKNOWN = 4   # order created, signature requested, outcome not known yet
+
+SIGN_DONE_STATES = {"DONE", "COMPLETED", "SIGNED"}
+SIGN_WAITING_STATES = {"OPEN", "PROCESSING", "PENDING"}
+
+
+def _transfer_result(prefix: str, code: int, order_id, message: str, result: str = "") -> int:
+    """Print the outcome and one machine-readable RESULT line, then return the exit code."""
+    result = result or {TRANSFER_EXIT_OK: "signed", TRANSFER_EXIT_NOT_SIGNED: "not_signed",
+              TRANSFER_EXIT_SIGN_UNKNOWN: "unknown"}.get(code, "error")
+    print(f"{prefix} {message}", flush=True)
+    print(f"{prefix} RESULT: {result} order_id={order_id} exit={code}", flush=True)
+    return code
+
+
 def _print_transfer_summary(prefix: str, order: dict, sender: dict) -> None:
     amount = order.get("amount") or {}
     value = (amount.get("value") or 0) / (10 ** (amount.get("precision") or 2))
@@ -3485,6 +3505,10 @@ def cmd_transfer(args):
             raise ValueError(f"Date {day} is in the past")
     except ValueError as e:
         print(f"{prefix} ERROR: {e}", flush=True)
+        return 1
+
+    if args.sign and args.timeout <= 0:
+        print(f"{prefix} ERROR: --sign needs --timeout above 0 to wait for the phone approval", flush=True)
         return 1
 
     if args.sign and not args.yes and not sys.stdin.isatty():
@@ -3622,6 +3646,20 @@ def cmd_transfer(args):
             if text:
                 order_request["additionalInfo"] = {"text4x35": [text[i:i + 35] for i in range(0, len(text), 35)]}
 
+            if args.sign and not args.yes:
+                # Ask before creating anything, so "n" leaves nothing behind in George.
+                print(f"{prefix} About to create and sign:", flush=True)
+                print(f"{prefix}   From:    {sender.get('name')} ({_format_iban(sender_iban)})", flush=True)
+                print(f"{prefix}   To:      {receiver_name} ({_format_iban(receiver_iban)})", flush=True)
+                print(f"{prefix}   Amount:  {cents / 100:.2f} EUR", flush=True)
+                print(f"{prefix}   Date:    {str(order_request.get('transferDate') or '')[:10] or 'right away'}",
+                      flush=True)
+                print(f"{prefix}   Text:    {text or '-'}", flush=True)
+                print(f"{prefix}   Type:    {'instant' if args.instant else 'standard'}", flush=True)
+                if input(f"{prefix} Create and sign this transfer? [y/N] ").strip().lower() != "y":
+                    print(f"{prefix} Cancelled; nothing was created.", flush=True)
+                    return TRANSFER_EXIT_ERROR
+
             endpoint = "sepa" if is_sepa else "domestic"
             status, order = _george_api(page, "POST", f"{PAYMENTS_API_URL}/{endpoint}", auth, order_request)
             if status not in (200, 201) or not isinstance(order, dict) or not order.get("id"):
@@ -3630,54 +3668,76 @@ def cmd_transfer(args):
             _print_transfer_summary(prefix, order, sender)
 
             if not args.sign:
-                print(f"{prefix} NOT signed. Sign it in George, or delete it there if you don't need it.", flush=True)
-                return 0
+                return _transfer_result(prefix, TRANSFER_EXIT_OK, order["id"],
+                                        "NOT signed (no --sign). Sign it in George, or delete it there if you don't need it.",
+                                        result="created")
 
+            order_id = order["id"]
             sign_id = (order.get("signInfo") or {}).get("signId")
             if not sign_id:
-                print(f"{prefix} ERROR: George returned no signId; sign the order in George instead.", flush=True)
-                return 1
-            if not args.yes:
-                if input(f"{prefix} Sign this transfer? [y/N] ").strip().lower() != "y":
-                    print(f"{prefix} NOT signed. The order stays open in George; delete it there if you don't need it.",
-                          flush=True)
-                    return 1
+                return _transfer_result(prefix, TRANSFER_EXIT_NOT_SIGNED, order_id,
+                                        "George returned no signId. NOT signed; sign or delete the order in George.")
 
-            order_url = f"{PAYMENTS_API_URL}/{quote(str(order['id']), safe='')}"
+            order_url = f"{PAYMENTS_API_URL}/{quote(str(order_id), safe='')}"
             sign_url = f"{order_url}/sign/{quote(str(sign_id), safe='')}"
             _george_api(page, "GET", sign_url, auth)  # George's form loads the sign info first
             status, sign = _george_api(page, "POST", sign_url, auth, {"authorizationType": "GEORGE_TOKEN"})
             if status != 200 or not isinstance(sign, dict):
                 _print_api_error(prefix, "Starting the signature", status, sign)
-                return 1
+                if 400 <= status < 500:
+                    return _transfer_result(prefix, TRANSFER_EXIT_NOT_SIGNED, order_id,
+                                            "NOT signed. Sign or delete the order in George.")
+                return _transfer_result(prefix, TRANSFER_EXIT_SIGN_UNKNOWN, order_id,
+                                        "The signature may have been requested; check your phone and the order "
+                                        "in George. Do not rerun this command.")
             print(f"{prefix} Approve the transfer on your phone now (waiting up to {args.timeout}s)...", flush=True)
 
             poll = sign.get("poll") if isinstance(sign.get("poll"), dict) else {}
             poll_url = poll.get("url")
             interval_ms = max(int(poll.get("interval") or 3000), 1000)
-            deadline = time.time() + max(args.timeout, 0)
+            deadline = time.time() + args.timeout
+            poll_state = None
             while poll_url and time.time() < deadline:
                 page.wait_for_timeout(interval_ms)
                 _, poll_body = _george_api(page, "GET", poll_url, auth)
-                poll_state = (poll_body.get("state") or poll_body.get("status")) if isinstance(poll_body, dict) else None
-                if poll_state and poll_state not in ("PROCESSING", "PENDING", "OPEN"):
-                    break
+                state = (poll_body.get("state") or poll_body.get("status")) if isinstance(poll_body, dict) else None
+                if state:
+                    poll_state = str(state).upper()
+                    if poll_state not in SIGN_WAITING_STATES:
+                        break
 
-            # Report what George now says about the order, whatever the poll returned.
-            status, final = _george_api(page, "GET", order_url, auth)
-            if status != 200 or not isinstance(final, dict):
-                _print_api_error(prefix, "Reading the order after signing", status, final)
-                return 1
-            sign_state = (final.get("signInfo") or {}).get("state")
-            print(f"{prefix} George: state={final.get('state')} sign state={sign_state}", flush=True)
-            if sign_state == "OPEN":
-                print(f"{prefix} NOT signed (no approval in time). The order stays open in George.", flush=True)
-                return 1
-            if sign_state in ("PROCESSING", "PENDING"):
-                print(f"{prefix} Still waiting for the approval; check the order in George.", flush=True)
-                return 1
-            print(f"{prefix} Signed.", flush=True)
-            return 0
+            # Check what George now says about the order. A finished poll can be ahead of the order,
+            # so give the order a few seconds to catch up before deciding.
+            sign_state = None
+            for attempt in range(4):
+                status, final = _george_api(page, "GET", order_url, auth)
+                if status == 200 and isinstance(final, dict):
+                    sign_state = str((final.get("signInfo") or {}).get("state") or "").upper() or None
+                    print(f"{prefix} George: state={final.get('state')} sign state={sign_state} "
+                          f"(poll: {poll_state or '-'})", flush=True)
+                    if not (poll_state in SIGN_DONE_STATES and sign_state in SIGN_WAITING_STATES):
+                        break
+                else:
+                    _print_api_error(prefix, "Reading the order after signing", status, final)
+                if attempt < 3:
+                    page.wait_for_timeout(2000)
+
+            # Only an explicit success state counts as signed.
+            waiting = (None, *SIGN_WAITING_STATES)
+            if sign_state in SIGN_DONE_STATES:
+                return _transfer_result(prefix, TRANSFER_EXIT_OK, order_id, "Signed.")
+            if poll_state in SIGN_DONE_STATES and sign_state in waiting:
+                return _transfer_result(prefix, TRANSFER_EXIT_OK, order_id,
+                                        "Signed (the approval went through; George hasn't updated the order yet).")
+            refused = sign_state if sign_state not in waiting else (
+                poll_state if poll_state not in waiting and poll_state not in SIGN_DONE_STATES else None)
+            if refused and poll_state not in SIGN_DONE_STATES:
+                return _transfer_result(prefix, TRANSFER_EXIT_NOT_SIGNED, order_id,
+                                        f"NOT signed (state {refused}). The order may stay open in George; "
+                                        "sign or delete it there.")
+            return _transfer_result(prefix, TRANSFER_EXIT_SIGN_UNKNOWN, order_id,
+                                    "Not confirmed as signed. The phone approval may still go through; "
+                                    "check the order in George. Do not rerun this command.")
         finally:
             context.close()
 
@@ -4556,7 +4616,7 @@ def main():
     transfer_parser.add_argument("--date", default=None, help="Execution date YYYY-MM-DD (default: earliest possible)")
     transfer_parser.add_argument("--instant", action="store_true", help="Send as an instant payment")
     transfer_parser.add_argument("--sign", action="store_true",
-                                 help="Sign after creating it (asks y/N, then approve on your phone)")
+                                 help="Sign after creating it (asks y/N before creating, then approve on your phone). Exit 3/4 mean an order exists: do not rerun")
     transfer_parser.add_argument("--yes", action="store_true",
                                  help="With --sign: skip the y/N question (the phone approval is still required)")
     transfer_parser.add_argument("--ignore-payee-check", action="store_true",
